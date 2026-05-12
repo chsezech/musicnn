@@ -1,253 +1,430 @@
-import tensorflow as tf
-from musicnn import configuration as config
+"""PyTorch implementation of musicnn/vgg audio tagging models.
 
-# disabling deprecation warnings (caused by change from tensorflow 1.x to 2.x)
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+Weights are mutually intelligible with the original TF v1 checkpoints.
+Use ``load_tf_checkpoint(model, ckpt_path)`` to transfer weights.
+
+TF -> PyTorch weight conversion rules
+--------------------------------------
+  Conv2d kernel : TF [H, W, C_in, C_out] -> PT [C_out, C_in, H, W]  (.permute(3,2,0,1))
+  Dense kernel  : TF [in, out]            -> PT [out, in]             (.T)
+  BatchNorm     : gamma->weight, beta->bias,
+                  moving_mean->running_mean, moving_variance->running_var  (direct copy)
+  Biases        : direct copy (same shape)
+
+TF checkpoint variable mapping (MusicNN)
+-----------------------------------------
+  batch_normalization/...     -> model.input_bn
+  conv2d/...                  -> model.timbral_f74.conv
+  batch_normalization_1/...   -> model.timbral_f74.bn
+  conv2d_1/...                -> model.timbral_f77.conv
+  batch_normalization_2/...   -> model.timbral_f77.bn
+  conv2d_2/...                -> model.tempo_s1.conv
+  batch_normalization_3/...   -> model.tempo_s1.bn
+  conv2d_3/...                -> model.tempo_s2.conv
+  batch_normalization_4/...   -> model.tempo_s2.bn
+  conv2d_4/...                -> model.tempo_s3.conv
+  batch_normalization_5/...   -> model.tempo_s3.bn
+  conv2d_5/...                -> model.midend_conv1.conv
+  batch_normalization_6/...   -> model.midend_conv1.bn
+  conv2d_6/...                -> model.midend_conv2.conv
+  batch_normalization_7/...   -> model.midend_conv2.bn
+  conv2d_7/...                -> model.midend_conv3.conv
+  batch_normalization_8/...   -> model.midend_conv3.bn
+  batch_normalization_9/...   -> model.flat_bn
+  dense/...                   -> model.dense
+  batch_normalization_10/...  -> model.dense_bn
+  dense_1/...                 -> model.logits
+
+TF checkpoint variable mapping (VGG)
+--------------------------------------
+  batch_normalization/...     -> model.input_bn
+  1CNN/...                    -> model.conv1
+  batch_normalization_1/...   -> model.bn1
+  2CNN/...                    -> model.conv2
+  batch_normalization_2/...   -> model.bn2
+  3CNN/...                    -> model.conv3
+  batch_normalization_3/...   -> model.bn3
+  4CNN/...                    -> model.conv4
+  batch_normalization_4/...   -> model.bn4
+  5CNN/...                    -> model.conv5
+  batch_normalization_5/...   -> model.bn5
+  dense/...                   -> model.output
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import configuration as config
+
+# Match TF v1 BatchNorm defaults: epsilon=0.001, decay=0.99 (PyTorch momentum = 1 - decay)
+_BN_EPS = 1e-3
+_BN_MOMENTUM = 0.01
 
 
-def define_model(x, is_training, model, num_classes):
+# ---------------------------------------------------------------------------
+# Public factory (mirrors original TF define_model signature, minus tensors)
+# ---------------------------------------------------------------------------
 
-    if model == 'MTT_musicnn':
-        return build_musicnn(x, is_training, num_classes, num_filt_midend=64, num_units_backend=200)
-
-    elif model == 'MTT_vgg':
-        return vgg(x, is_training, num_classes, 128)
-
-    elif model == 'MSD_musicnn':
-        return build_musicnn(x, is_training, num_classes, num_filt_midend=64, num_units_backend=200)
-
-    elif model == 'MSD_musicnn_big':
-        return build_musicnn(x, is_training, num_classes, num_filt_midend=512, num_units_backend=500)
-
-    elif model == 'MSD_vgg':
-        return vgg(x, is_training, num_classes, 128)            
-
+def define_model(model_name, num_classes):
+    """Return an nn.Module for *model_name* with *num_classes* outputs."""
+    if model_name in ('MTT_musicnn', 'MSD_musicnn'):
+        return MusicnnModel(num_classes, num_filt_midend=64, num_units_backend=200)
+    elif model_name == 'MSD_musicnn_big':
+        return MusicnnModel(num_classes, num_filt_midend=512, num_units_backend=500)
+    elif model_name in ('MTT_vgg', 'MSD_vgg'):
+        return VGGModel(num_classes)
     else:
         raise ValueError('Model not implemented!')
 
 
-def build_musicnn(x, is_training, num_classes, num_filt_frontend=1.6, num_filt_midend=64, num_units_backend=200):
+# ---------------------------------------------------------------------------
+# Building-block modules
+# ---------------------------------------------------------------------------
 
-    ### front-end ### musically motivated CNN
-    frontend_features_list = frontend(x, is_training, config.N_MELS, num_filt=1.6, type='7774timbraltemporal')
-    # concatnate features coming from the front-end
-    frontend_features = tf.concat(frontend_features_list, 2)
+class TimbralBlock(nn.Module):
+    """Conv2d(valid) -> ReLU -> BN -> MaxPool(all-freq) -> squeeze freq dim."""
 
-    ### mid-end ### dense layers
-    midend_features_list = midend(frontend_features, is_training, num_filt_midend)
-    # dense connection: concatnate features coming from different layers of the front- and mid-end
-    midend_features = tf.concat(midend_features_list, 2)
+    def __init__(self, filters, kernel_h, kernel_w):
+        super().__init__()
+        self.conv = nn.Conv2d(1, filters, (kernel_h, kernel_w), padding=0)
+        self.bn   = nn.BatchNorm2d(filters, eps=_BN_EPS, momentum=_BN_MOMENTUM)
 
-    ### back-end ### temporal pooling
-    logits, penultimate, mean_pool, max_pool = backend(midend_features, is_training, num_classes, num_units_backend, type='globalpool_dense')
-
-    # [extract features] temporal and timbral features from the front-end
-    timbral = tf.concat([frontend_features_list[0], frontend_features_list[1]], 2)
-    temporal = tf.concat([frontend_features_list[2], frontend_features_list[3], frontend_features_list[4]], 2)
-    # [extract features] mid-end features
-    cnn1, cnn2, cnn3 = midend_features_list[1], midend_features_list[2], midend_features_list[3]
-    mean_pool = tf.squeeze(mean_pool, [2])
-    max_pool = tf.squeeze(max_pool, [2])
-
-    return logits, timbral, temporal, cnn1, cnn2, cnn3, mean_pool, max_pool, penultimate
+    def forward(self, x):
+        # x: [B, 1, T+6, F]  (pre-padded ±3 on time axis)
+        x = F.relu(self.conv(x))              # [B, filters, T, F-k+1]
+        x = self.bn(x)
+        x = F.max_pool2d(x, (1, x.shape[3])) # [B, filters, T, 1]
+        return x.squeeze(3)                   # [B, filters, T]
 
 
-def frontend(x, is_training, yInput, num_filt, type):
+class TempoBlock(nn.Module):
+    """Conv2d(same-time) -> ReLU -> BN -> MaxPool(all-freq) -> squeeze freq dim."""
 
-    expand_input = tf.expand_dims(x, 3)
-    normalized_input = tf.compat.v1.layers.batch_normalization(expand_input, training=is_training)
+    def __init__(self, filters, kernel_h, n_mels):
+        super().__init__()
+        self.conv = nn.Conv2d(1, filters, (kernel_h, 1), padding=0)
+        self.bn   = nn.BatchNorm2d(filters, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        # TF 'same' padding for stride=1: total = k-1, pad_before = (k-1)//2
+        self.pad_before = (kernel_h - 1) // 2
+        self.pad_after  = kernel_h - 1 - self.pad_before
+        self.n_mels = n_mels
 
-    if 'timbral' in type:
-
-        # padding only time domain for an efficient 'same' implementation
-        # (since we pool throughout all frequency afterwards)
-        input_pad_7 = tf.pad(normalized_input, [[0, 0], [3, 3], [0, 0], [0, 0]], "CONSTANT")
-
-        if '74' in type:
-            f74 = timbral_block(inputs=input_pad_7,
-                           filters=int(num_filt*128),
-                           kernel_size=[7, int(0.4 * yInput)],
-                           is_training=is_training)
-
-        if '77' in type:
-            f77 = timbral_block(inputs=input_pad_7,
-                           filters=int(num_filt*128),
-                           kernel_size=[7, int(0.7 * yInput)],
-                           is_training=is_training)
-
-    if 'temporal' in type:
-
-        s1 = tempo_block(inputs=normalized_input,
-                          filters=int(num_filt*32),
-                          kernel_size=[128,1],
-                          is_training=is_training)
-
-        s2 = tempo_block(inputs=normalized_input,
-                          filters=int(num_filt*32),
-                          kernel_size=[64,1],
-                          is_training=is_training)
-
-        s3 = tempo_block(inputs=normalized_input,
-                          filters=int(num_filt*32),
-                          kernel_size=[32,1],
-                          is_training=is_training)
+    def forward(self, x):
+        # x: [B, 1, T, F]
+        x = F.pad(x, (0, 0, self.pad_before, self.pad_after)) # [B, 1, T, F] (same T)
+        x = F.relu(self.conv(x))                               # [B, filters, T, F]
+        x = self.bn(x)
+        x = F.max_pool2d(x, (1, self.n_mels))                 # [B, filters, T, 1]
+        return x.squeeze(3)                                    # [B, filters, T]
 
 
-    # choose the feature maps we want to use for the experiment
-    if type == '7774timbraltemporal':
-        return [f74, f77, s1, s2, s3]
+class MidendLayer(nn.Module):
+    """pad(±3 time) -> Conv2d(valid, [7, in_w]) -> ReLU -> BN -> permute.
+
+    Operates on tensors in layout [B, 1, T, W] (channel=1, features in W).
+    Produces output in the same layout [B, 1, T, n_filt], mirroring the
+    TF transpose [0,1,3,2] after each conv in the midend.
+    """
+
+    def __init__(self, in_width, n_filt):
+        super().__init__()
+        self.conv = nn.Conv2d(1, n_filt, (7, in_width), padding=0)
+        self.bn   = nn.BatchNorm2d(n_filt, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+
+    def forward(self, x):
+        # x: [B, 1, T, in_width]
+        x = F.pad(x, (0, 0, 3, 3))      # [B, 1, T+6, in_width]
+        x = F.relu(self.conv(x))          # [B, n_filt, T, 1]
+        x = self.bn(x)
+        return x.permute(0, 3, 2, 1)     # [B, 1, T, n_filt]
 
 
-def timbral_block(inputs, filters, kernel_size, is_training, padding="valid", activation=tf.nn.relu):
+# ---------------------------------------------------------------------------
+# MusicNN model
+# ---------------------------------------------------------------------------
 
-    conv = tf.compat.v1.layers.conv2d(inputs=inputs,
-                            filters=filters,
-                            kernel_size=kernel_size,
-                            padding=padding,
-                            activation=activation)
-    bn_conv = tf.compat.v1.layers.batch_normalization(conv, training=is_training)
-    pool = tf.compat.v1.layers.max_pooling2d(inputs=bn_conv,
-                                   pool_size=[1, bn_conv.shape[2]],
-                                   strides=[1, bn_conv.shape[2]])
-    return tf.squeeze(pool, [2])
+class MusicnnModel(nn.Module):
+    """Musically-motivated CNN with timbral/temporal front-end.
+
+    Forward returns the same tuple as the original TF define_model:
+      (logits, timbral, temporal, cnn1, cnn2, cnn3, mean_pool, max_pool, penultimate)
+
+    Feature tensor shapes (matching TF convention: time first):
+      timbral, temporal, cnn1, cnn2, cnn3 : [B, T, features]
+      mean_pool, max_pool                 : [B, total_features]
+      penultimate                         : [B, num_units_backend]
+      logits                              : [B, num_classes]
+    """
+
+    def __init__(self, num_classes, n_mels=config.N_MELS, num_filt_frontend=1.6,
+                 num_filt_midend=64, num_units_backend=200):
+        super().__init__()
+        f  = num_filt_frontend
+        f74 = int(f * 128)
+        f77 = int(f * 128)
+        sf  = int(f * 32)
+        total_frontend = f74 + f77 + sf * 3
+
+        # --- frontend ---
+        self.input_bn    = nn.BatchNorm2d(1, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.timbral_f74 = TimbralBlock(f74, 7, int(0.4 * n_mels))
+        self.timbral_f77 = TimbralBlock(f77, 7, int(0.7 * n_mels))
+        self.tempo_s1    = TempoBlock(sf, 128, n_mels)
+        self.tempo_s2    = TempoBlock(sf,  64, n_mels)
+        self.tempo_s3    = TempoBlock(sf,  32, n_mels)
+
+        # --- midend ---
+        self.midend_conv1 = MidendLayer(total_frontend,  num_filt_midend)
+        self.midend_conv2 = MidendLayer(num_filt_midend, num_filt_midend)
+        self.midend_conv3 = MidendLayer(num_filt_midend, num_filt_midend)
+
+        # --- backend ---
+        total_features = total_frontend + 3 * num_filt_midend
+        flat_size      = 2 * total_features  # max_pool ++ mean_pool
+
+        self.flat_bn  = nn.BatchNorm1d(flat_size, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.dense    = nn.Linear(flat_size, num_units_backend)
+        self.dense_bn = nn.BatchNorm1d(num_units_backend, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.logits   = nn.Linear(num_units_backend, num_classes)
+
+        self._f74 = f74
+        self._f77 = f77
+
+    def forward(self, x):
+        # x: [B, T, F]
+
+        # ---- frontend ----
+        x4d   = x.unsqueeze(1)                          # [B, 1, T, F]
+        x4d   = self.input_bn(x4d)
+        x_pad = F.pad(x4d, (0, 0, 3, 3))               # [B, 1, T+6, F]
+
+        f74 = self.timbral_f74(x_pad)                   # [B, f74, T]
+        f77 = self.timbral_f77(x_pad)                   # [B, f77, T]
+        s1  = self.tempo_s1(x4d)                        # [B, sf,  T]
+        s2  = self.tempo_s2(x4d)
+        s3  = self.tempo_s3(x4d)
+
+        frontend_feats = torch.cat([f74, f77, s1, s2, s3], dim=1)  # [B, total_frontend, T]
+
+        # ---- midend ----
+        # Rearrange to [B, 1, T, total_frontend] to mirror TF's NHWC layout
+        fe = frontend_feats.permute(0, 2, 1).unsqueeze(1)  # [B, 1, T, total_frontend]
+
+        conv1_t = self.midend_conv1(fe)          # [B, 1, T, n_filt]
+        conv2_t = self.midend_conv2(conv1_t)     # [B, 1, T, n_filt]
+        res2    = conv2_t + conv1_t
+        conv3_t = self.midend_conv3(res2)        # [B, 1, T, n_filt]
+        res3    = conv3_t + res2
+
+        # Dense skip-connection concat along feature (W) dim
+        midend_feats = torch.cat([fe, conv1_t, res2, res3], dim=3)  # [B, 1, T, total_features]
+
+        # ---- backend ----
+        max_pool  = midend_feats.max(dim=2)[0]   # [B, 1, total_features]
+        mean_pool = midend_feats.mean(dim=2)      # [B, 1, total_features]
+        tmp_pool  = torch.cat([max_pool, mean_pool], dim=2)  # [B, 1, 2*total]
+        flat      = tmp_pool.flatten(1)           # [B, 2*total]
+
+        flat      = self.flat_bn(flat)
+        flat      = F.dropout(flat, p=0.5, training=self.training)
+        dense_out = F.relu(self.dense(flat))
+        dense_out = self.dense_bn(dense_out)
+        dense_out = F.dropout(dense_out, p=0.5, training=self.training)
+        out       = self.logits(dense_out)
+
+        # ---- feature extraction outputs (time-first to match TF shapes) ----
+        timbral  = torch.cat([f74, f77], dim=1).permute(0, 2, 1)   # [B, T, f74+f77]
+        temporal = torch.cat([s1, s2, s3], dim=1).permute(0, 2, 1) # [B, T, 3*sf]
+        cnn1     = conv1_t.squeeze(1)                               # [B, T, n_filt]
+        cnn2     = res2.squeeze(1)                                  # [B, T, n_filt]
+        cnn3     = res3.squeeze(1)                                  # [B, T, n_filt]
+        mean_out = mean_pool.squeeze(1)                             # [B, total_features]
+        max_out  = max_pool.squeeze(1)                              # [B, total_features]
+
+        return out, timbral, temporal, cnn1, cnn2, cnn3, mean_out, max_out, dense_out
 
 
-def tempo_block(inputs, filters, kernel_size, is_training, padding="same", activation=tf.nn.relu):
+# ---------------------------------------------------------------------------
+# VGG model
+# ---------------------------------------------------------------------------
 
-    conv = tf.compat.v1.layers.conv2d(inputs=inputs,
-                            filters=filters,
-                            kernel_size=kernel_size,
-                            padding=padding,
-                            activation=activation)
-    bn_conv = tf.compat.v1.layers.batch_normalization(conv, training=is_training)
-    pool = tf.compat.v1.layers.max_pooling2d(inputs=bn_conv,
-                                   pool_size=[1, bn_conv.shape[2]],
-                                   strides=[1, bn_conv.shape[2]])
-    return tf.squeeze(pool, [2])
+def _vgg_pool_output_size(h, w, pool_size, stride):
+    """Apply one max-pool step (valid padding) and return (h_out, w_out)."""
+    return (h - pool_size[0]) // stride[0] + 1, (w - pool_size[1]) // stride[1] + 1
 
 
-def midend(front_end_output, is_training, num_filt):
+class VGGModel(nn.Module):
+    """VGG-style CNN for audio tagging.
 
-    front_end_output = tf.expand_dims(front_end_output, 3)
+    Forward returns the same tuple as the original TF vgg():
+      (output, pool1, pool2, pool3, pool4, pool5)
 
-    # conv layer 1 - adapting dimensions
-    front_end_pad = tf.pad(front_end_output, [[0, 0], [3, 3], [0, 0], [0, 0]], "CONSTANT")
-    conv1 = tf.compat.v1.layers.conv2d(inputs=front_end_pad,
-                             filters=num_filt,
-                             kernel_size=[7, front_end_pad.shape[2]],
-                             padding="valid",
-                             activation=tf.nn.relu)
-    bn_conv1 = tf.compat.v1.layers.batch_normalization(conv1, training=is_training)
-    bn_conv1_t = tf.transpose(bn_conv1, [0, 1, 3, 2])
+    All pooling feature maps are in PyTorch NCHW format [B, C, T, F].
+    """
 
-    # conv layer 2 - residual connection
-    bn_conv1_pad = tf.pad(bn_conv1_t, [[0, 0], [3, 3], [0, 0], [0, 0]], "CONSTANT")
-    conv2 = tf.compat.v1.layers.conv2d(inputs=bn_conv1_pad,
-                             filters=num_filt,
-                             kernel_size=[7, bn_conv1_pad.shape[2]],
-                             padding="valid",
-                             activation=tf.nn.relu)
-    bn_conv2 = tf.compat.v1.layers.batch_normalization(conv2, training=is_training)
-    conv2 = tf.transpose(bn_conv2, [0, 1, 3, 2])
-    res_conv2 = tf.add(conv2, bn_conv1_t)
+    def __init__(self, num_classes, num_filters=128,
+                 n_mels=config.N_MELS, n_frames=187):
+        super().__init__()
+        nf = num_filters
 
-    # conv layer 3 - residual connection
-    bn_conv2_pad = tf.pad(res_conv2, [[0, 0], [3, 3], [0, 0], [0, 0]], "CONSTANT")
-    conv3 = tf.compat.v1.layers.conv2d(inputs=bn_conv2_pad,
-                             filters=num_filt,
-                             kernel_size=[7, bn_conv2_pad.shape[2]],
-                             padding="valid",
-                             activation=tf.nn.relu)
-    bn_conv3 = tf.compat.v1.layers.batch_normalization(conv3, training=is_training)
-    conv3 = tf.transpose(bn_conv3, [0, 1, 3, 2])
-    res_conv3 = tf.add(conv3, res_conv2)
+        self.input_bn = nn.BatchNorm2d(1,  eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.conv1    = nn.Conv2d(1,  nf, 3, padding=1)
+        self.bn1      = nn.BatchNorm2d(nf, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.conv2    = nn.Conv2d(nf, nf, 3, padding=1)
+        self.bn2      = nn.BatchNorm2d(nf, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.conv3    = nn.Conv2d(nf, nf, 3, padding=1)
+        self.bn3      = nn.BatchNorm2d(nf, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.conv4    = nn.Conv2d(nf, nf, 3, padding=1)
+        self.bn4      = nn.BatchNorm2d(nf, eps=_BN_EPS, momentum=_BN_MOMENTUM)
+        self.conv5    = nn.Conv2d(nf, nf, 3, padding=1)
+        self.bn5      = nn.BatchNorm2d(nf, eps=_BN_EPS, momentum=_BN_MOMENTUM)
 
-    return [front_end_output, bn_conv1_t, res_conv2, res_conv3]
+        # Compute flattened size from pooling geometry (valid padding throughout)
+        h, w = n_frames, n_mels
+        h, w = _vgg_pool_output_size(h, w, (4, 1), (2, 2))
+        h, w = _vgg_pool_output_size(h, w, (2, 2), (2, 2))
+        h, w = _vgg_pool_output_size(h, w, (2, 2), (2, 2))
+        h, w = _vgg_pool_output_size(h, w, (2, 2), (2, 2))
+        h, w = _vgg_pool_output_size(h, w, (4, 4), (4, 4))
+        self.output = nn.Linear(nf * h * w, num_classes)
+
+    def forward(self, x):
+        # x: [B, T, F]
+        x = x.unsqueeze(1)                                  # [B, 1, T, F]
+        x = self.input_bn(x)
+
+        x     = F.relu(self.conv1(x))
+        x     = self.bn1(x)
+        pool1 = F.max_pool2d(x, (4, 1), stride=(2, 2))
+        x     = F.dropout(pool1, p=0.25, training=self.training)
+
+        x     = F.relu(self.conv2(x))
+        x     = self.bn2(x)
+        pool2 = F.max_pool2d(x, (2, 2), stride=(2, 2))
+        x     = F.dropout(pool2, p=0.25, training=self.training)
+
+        x     = F.relu(self.conv3(x))
+        x     = self.bn3(x)
+        pool3 = F.max_pool2d(x, (2, 2), stride=(2, 2))
+        x     = F.dropout(pool3, p=0.25, training=self.training)
+
+        x     = F.relu(self.conv4(x))
+        x     = self.bn4(x)
+        pool4 = F.max_pool2d(x, (2, 2), stride=(2, 2))
+        x     = F.dropout(pool4, p=0.25, training=self.training)
+
+        x     = F.relu(self.conv5(x))
+        x     = self.bn5(x)
+        pool5 = F.max_pool2d(x, (4, 4), stride=(4, 4))
+
+        flat   = F.dropout(pool5.flatten(1), p=0.5, training=self.training)
+        output = self.output(flat)
+        return output, pool1, pool2, pool3, pool4, pool5
 
 
-def backend(feature_map, is_training, num_classes, output_units, type):
+# ---------------------------------------------------------------------------
+# TF checkpoint -> PyTorch weight transfer
+# ---------------------------------------------------------------------------
 
-    # temporal pooling
-    max_pool = tf.reduce_max(feature_map, axis=1)
-    mean_pool, var_pool = tf.nn.moments(feature_map, axes=[1])
-    tmp_pool = tf.concat([max_pool, mean_pool], 2)
+# Maps TF variable prefix -> PyTorch state_dict prefix + conversion type
+_MUSICNN_MAP = [
+    ('batch_normalization',    'input_bn',         'bn'),
+    ('conv2d',                 'timbral_f74.conv',  'conv'),
+    ('batch_normalization_1',  'timbral_f74.bn',    'bn'),
+    ('conv2d_1',               'timbral_f77.conv',  'conv'),
+    ('batch_normalization_2',  'timbral_f77.bn',    'bn'),
+    ('conv2d_2',               'tempo_s1.conv',     'conv'),
+    ('batch_normalization_3',  'tempo_s1.bn',       'bn'),
+    ('conv2d_3',               'tempo_s2.conv',     'conv'),
+    ('batch_normalization_4',  'tempo_s2.bn',       'bn'),
+    ('conv2d_4',               'tempo_s3.conv',     'conv'),
+    ('batch_normalization_5',  'tempo_s3.bn',       'bn'),
+    ('conv2d_5',               'midend_conv1.conv', 'conv'),
+    ('batch_normalization_6',  'midend_conv1.bn',   'bn'),
+    ('conv2d_6',               'midend_conv2.conv', 'conv'),
+    ('batch_normalization_7',  'midend_conv2.bn',   'bn'),
+    ('conv2d_7',               'midend_conv3.conv', 'conv'),
+    ('batch_normalization_8',  'midend_conv3.bn',   'bn'),
+    ('batch_normalization_9',  'flat_bn',           'bn'),
+    ('dense',                  'dense',             'dense'),
+    ('batch_normalization_10', 'dense_bn',          'bn'),
+    ('dense_1',                'logits',            'dense'),
+]
 
-    # penultimate dense layer
-    flat_pool = tf.compat.v1.layers.flatten(tmp_pool)
-    flat_pool = tf.compat.v1.layers.batch_normalization(flat_pool, training=is_training)
-    flat_pool_dropout = tf.compat.v1.layers.dropout(flat_pool, rate=0.5, training=is_training)
-    dense = tf.compat.v1.layers.dense(inputs=flat_pool_dropout,
-                            units=output_units,
-                            activation=tf.nn.relu)
-    bn_dense = tf.compat.v1.layers.batch_normalization(dense, training=is_training)
-    dense_dropout = tf.compat.v1.layers.dropout(bn_dense, rate=0.5, training=is_training)
-
-    # output dense layer
-    logits = tf.compat.v1.layers.dense(inputs=dense_dropout,
-                           activation=None,
-                           units=num_classes)
-
-    return logits, bn_dense, mean_pool, max_pool
+_VGG_MAP = [
+    ('batch_normalization',   'input_bn', 'bn'),
+    ('1CNN',                  'conv1',    'conv'),
+    ('batch_normalization_1', 'bn1',      'bn'),
+    ('2CNN',                  'conv2',    'conv'),
+    ('batch_normalization_2', 'bn2',      'bn'),
+    ('3CNN',                  'conv3',    'conv'),
+    ('batch_normalization_3', 'bn3',      'bn'),
+    ('4CNN',                  'conv4',    'conv'),
+    ('batch_normalization_4', 'bn4',      'bn'),
+    ('5CNN',                  'conv5',    'conv'),
+    ('batch_normalization_5', 'bn5',      'bn'),
+    ('dense',                 'output',   'dense'),
+]
 
 
-def vgg(x, is_training, num_classes, num_filters=32):
-    input_layer = tf.expand_dims(x, 3)
-    bn_input = tf.compat.v1.layers.batch_normalization(input_layer, training=is_training)
+def _load_tf_var(reader, name):
+    return torch.tensor(reader.get_tensor(name))
 
-    conv1 = tf.compat.v1.layers.conv2d(inputs=bn_input,
-                             filters=num_filters,
-                             kernel_size=[3, 3],
-                             padding='same',
-                             activation=tf.nn.relu,
-                             name='1CNN')
-    bn_conv1 = tf.compat.v1.layers.batch_normalization(conv1, training=is_training)
-    pool1 = tf.compat.v1.layers.max_pooling2d(inputs=bn_conv1, pool_size=[4, 1], strides=[2, 2])
 
-    do_pool1 = tf.compat.v1.layers.dropout(pool1, rate=0.25, training=is_training)
-    conv2 = tf.compat.v1.layers.conv2d(inputs=do_pool1,
-                             filters=num_filters,
-                             kernel_size=[3, 3],
-                             padding='same',
-                             activation=tf.nn.relu,
-                             name='2CNN')
-    bn_conv2 = tf.compat.v1.layers.batch_normalization(conv2, training=is_training)
-    pool2 = tf.compat.v1.layers.max_pooling2d(inputs=bn_conv2, pool_size=[2, 2], strides=[2, 2])
+def tf_checkpoint_to_state_dict(model, ckpt_path):
+    """Build a PyTorch ``state_dict`` from a TF v1 checkpoint.
 
-    do_pool2 = tf.compat.v1.layers.dropout(pool2, rate=0.25, training=is_training)
-    conv3 = tf.compat.v1.layers.conv2d(inputs=do_pool2,
-                             filters=num_filters,
-                             kernel_size=[3, 3],
-                             padding='same',
-                             activation=tf.nn.relu,
-                             name='3CNN')
-    bn_conv3 = tf.compat.v1.layers.batch_normalization(conv3, training=is_training)
-    pool3 = tf.compat.v1.layers.max_pooling2d(inputs=bn_conv3, pool_size=[2, 2], strides=[2, 2])
+    Args:
+        model: a ``MusicnnModel`` or ``VGGModel`` instance (used only to
+               determine the correct variable map).
+        ckpt_path: path to the TF checkpoint directory or file prefix.
 
-    do_pool3 = tf.compat.v1.layers.dropout(pool3, rate=0.25, training=is_training)
-    conv4 = tf.compat.v1.layers.conv2d(inputs=do_pool3,
-                             filters=num_filters,
-                             kernel_size=[3, 3],
-                             padding='same',
-                             activation=tf.nn.relu,
-                             name='4CNN')
-    bn_conv4 = tf.compat.v1.layers.batch_normalization(conv4, training=is_training)
-    pool4 = tf.compat.v1.layers.max_pooling2d(inputs=bn_conv4, pool_size=[2, 2], strides=[2, 2])
+    Returns:
+        A ``dict`` compatible with ``model.load_state_dict()``.
 
-    do_pool4 = tf.compat.v1.layers.dropout(pool4, rate=0.25, training=is_training)
-    conv5 = tf.compat.v1.layers.conv2d(inputs=do_pool4, 
-                             filters=num_filters, 
-                             kernel_size=[3, 3], 
-                             padding='same', 
-                             activation=tf.nn.relu,
-                             name='5CNN')
-    bn_conv5 = tf.compat.v1.layers.batch_normalization(conv5, training=is_training)
-    pool5 = tf.compat.v1.layers.max_pooling2d(inputs=bn_conv5, pool_size=[4, 4], strides=[4, 4])
+    Requires ``tensorflow`` to be installed (TF is used only for reading the
+    checkpoint; the returned state_dict is pure PyTorch).
+    """
+    import tensorflow as tf  # optional dep; only needed for conversion
 
-    flat_pool5 = tf.compat.v1.layers.flatten(pool5)
-    do_pool5 = tf.compat.v1.layers.dropout(flat_pool5, rate=0.5, training=is_training)
-    output = tf.compat.v1.layers.dense(inputs=do_pool5,
-                            activation=None,
-                            units=num_classes)
-    return output, pool1, pool2, pool3, pool4, pool5   
+    reader = tf.train.load_checkpoint(ckpt_path)
+    var_map = _MUSICNN_MAP if isinstance(model, MusicnnModel) else _VGG_MAP
+    sd = {}
+
+    for tf_prefix, pt_prefix, kind in var_map:
+        if kind == 'conv':
+            # TF kernel: [H, W, C_in, C_out] -> PT: [C_out, C_in, H, W]
+            kernel = _load_tf_var(reader, f'{tf_prefix}/kernel')
+            sd[f'{pt_prefix}.weight'] = kernel.permute(3, 2, 0, 1).contiguous()
+            sd[f'{pt_prefix}.bias']   = _load_tf_var(reader, f'{tf_prefix}/bias')
+
+        elif kind == 'dense':
+            # TF kernel: [in, out] -> PT: [out, in]
+            kernel = _load_tf_var(reader, f'{tf_prefix}/kernel')
+            sd[f'{pt_prefix}.weight'] = kernel.T.contiguous()
+            sd[f'{pt_prefix}.bias']   = _load_tf_var(reader, f'{tf_prefix}/bias')
+
+        elif kind == 'bn':
+            sd[f'{pt_prefix}.weight']       = _load_tf_var(reader, f'{tf_prefix}/gamma')
+            sd[f'{pt_prefix}.bias']         = _load_tf_var(reader, f'{tf_prefix}/beta')
+            sd[f'{pt_prefix}.running_mean'] = _load_tf_var(reader, f'{tf_prefix}/moving_mean')
+            sd[f'{pt_prefix}.running_var']  = _load_tf_var(reader, f'{tf_prefix}/moving_variance')
+            # PyTorch BN also tracks num_batches; initialise to 0 (inference-ready)
+            sd[f'{pt_prefix}.num_batches_tracked'] = torch.zeros(1, dtype=torch.long)
+
+    return sd
+
+
+def load_tf_checkpoint(model, ckpt_path):
+    """Load a TF v1 checkpoint directly into *model* (in-place).
+
+    Args:
+        model: a ``MusicnnModel`` or ``VGGModel`` instance.
+        ckpt_path: path to the TF checkpoint directory or file prefix.
+
+    Requires ``tensorflow`` to be installed.
+    """
+    sd = tf_checkpoint_to_state_dict(model, ckpt_path)
+    model.load_state_dict(sd, strict=False)  # strict=False: ignores extra keys   
 
 
